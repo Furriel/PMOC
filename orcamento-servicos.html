@@ -894,22 +894,86 @@ function saveSettings() {
 
 // ── Google Drive (OAuth PKCE) ──
 const GDRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
-const CLIENT_ID = localStorage.getItem('gdrive_client_id') || '';
 
-function connectDrive() {
-  const cid = prompt('Informe seu Google OAuth Client ID:\n(Configure em console.cloud.google.com → APIs → Credenciais)', CLIENT_ID);
+function _base64url(buffer) {
+  return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function _generatePKCE() {
+  const array = crypto.getRandomValues(new Uint8Array(64));
+  const verifier = _base64url(array);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  const challenge = _base64url(digest);
+  return { verifier, challenge };
+}
+
+async function connectDrive() {
+  const stored = localStorage.getItem('gdrive_client_id') || '';
+  const cid = prompt('Informe seu Google OAuth Client ID:\n(Configure em console.cloud.google.com → APIs → Credenciais)', stored);
   if (!cid) return;
   localStorage.setItem('gdrive_client_id', cid);
+
+  const { verifier, challenge } = await _generatePKCE();
+  const redirectUri = location.origin + location.pathname;
+  sessionStorage.setItem('pkce_verifier', verifier);
+  sessionStorage.setItem('pkce_redirect_uri', redirectUri);
+
   const params = new URLSearchParams({
-    client_id: cid, redirect_uri: location.origin + location.pathname,
-    response_type: 'token', scope: GDRIVE_SCOPE, include_granted_scopes: 'true',
+    client_id: cid,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: GDRIVE_SCOPE,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    access_type: 'online',
+    include_granted_scopes: 'true',
   });
-  window.open('https://accounts.google.com/o/oauth2/v2/auth?' + params, '_blank', 'width=500,height=600');
-  showToast('Janela de login aberta. Após autorizar, cole o token.');
-  setTimeout(() => {
-    const token = prompt('Cole o access_token retornado pela URL após o login:');
-    if (token) { gapiToken = token; driveConnected = true; updateDriveUI(); showToast('Google Drive conectado!'); }
-  }, 3000);
+  location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params;
+}
+
+async function handleOAuthCallback(code) {
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  const redirectUri = sessionStorage.getItem('pkce_redirect_uri');
+  const cid = localStorage.getItem('gdrive_client_id');
+
+  // Remove code from URL without reloading the page
+  const clean = location.origin + location.pathname;
+  history.replaceState(null, '', clean);
+
+  if (!verifier || !cid) {
+    showToast('Erro: dados de autenticação não encontrados. Tente novamente.');
+    return;
+  }
+
+  // Remove PKCE data from sessionStorage only after validation, to avoid data loss on error
+  sessionStorage.removeItem('pkce_verifier');
+  sessionStorage.removeItem('pkce_redirect_uri');
+
+  try {
+    const res = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        client_id: cid,
+        code_verifier: verifier,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error_description || 'Falha na autenticação (HTTP ' + res.status + ')');
+    }
+    const data = await res.json();
+    gapiToken = data.access_token;
+    driveConnected = true;
+    updateDriveUI();
+    showToast('Google Drive conectado! ✅');
+  } catch (e) {
+    showToast('Falha ao conectar com o Drive: ' + e.message);
+  }
 }
 
 function updateDriveUI() {
@@ -999,6 +1063,13 @@ function showToast(msg) {
 // ── Init ──
 document.getElementById('f-date').value = today();
 renderQuoteList();
+
+// Handle OAuth PKCE callback (Google redirects back with ?code=...)
+(function checkOAuthCallback() {
+  const params = new URLSearchParams(location.search);
+  const code = params.get('code');
+  if (code) handleOAuthCallback(code);
+})();
 </script>
 </body>
 </html>
